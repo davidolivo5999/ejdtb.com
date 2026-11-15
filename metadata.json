@@ -1,0 +1,6 @@
+{
+  "name": "EJDTB Members Only",
+  "description": "Architectural heavyweight streetwear, 500gsm fleece, and limited-run outerwear by EJDTB Members Only.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
