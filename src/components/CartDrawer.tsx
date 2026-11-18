@@ -1,6 +1,26 @@
-import { ArrowLeft, CheckCircle2, Minus, Plus, ShoppingBag, Trash2, X } from 'lucide-react';
-import { useEffect, useState } from 'react';
-import type { CartItem, CheckoutErrors, CheckoutForm, OrderReceipt } from '../types/store';
+import {
+  AlertCircle,
+  ArrowLeft,
+  CheckCircle2,
+  CreditCard,
+  ExternalLink,
+  Loader2,
+  Lock,
+  Minus,
+  Plus,
+  ShoppingBag,
+  Trash2,
+  X,
+} from 'lucide-react';
+import { useEffect, useRef, useState } from 'react';
+import type {
+  CartItem,
+  CheckoutErrors,
+  CheckoutForm,
+  OrderReceipt,
+  SquarePaymentConfig,
+} from '../types/store';
+import { loadSquareSdk, SQUARE_CARD_STYLE, type SquareCardInstance } from '../utils/squareSdk';
 import {
   calculateTotals,
   formatCurrency,
@@ -38,6 +58,14 @@ export function CartDrawer({
   const [errors, setErrors] = useState<CheckoutErrors>({});
   const [receipt, setReceipt] = useState<OrderReceipt | null>(null);
 
+  const [paymentConfig, setPaymentConfig] = useState<SquarePaymentConfig | null>(null);
+  const [configLoading, setConfigLoading] = useState(false);
+  const [cardReady, setCardReady] = useState(false);
+  const [paymentError, setPaymentError] = useState<string | null>(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+
+  const cardRef = useRef<SquareCardInstance | null>(null);
+
   const totals = calculateTotals(items);
 
   useEffect(() => {
@@ -61,34 +89,180 @@ export function CartDrawer({
     }
   }, [isOpen, items.length, step]);
 
+  useEffect(() => {
+    if (!isOpen || step !== 'checkout') {
+      setCardReady(false);
+      if (cardRef.current) {
+        const instance = cardRef.current;
+        cardRef.current = null;
+        void instance.destroy().catch(() => {});
+      }
+      return;
+    }
+
+    let cancelled = false;
+    setConfigLoading(true);
+    setCardReady(false);
+    setPaymentError(null);
+
+    async function initSquare() {
+      try {
+        const res = await fetch('/api/payments/config');
+        if (!res.ok) {
+          throw new Error('Could not load Square payment configuration.');
+        }
+        const config = (await res.json()) as SquarePaymentConfig;
+        if (cancelled) return;
+        setPaymentConfig(config);
+
+        if (!config.configured || !config.applicationId || !config.locationId) {
+          setConfigLoading(false);
+          return;
+        }
+
+        const square = await loadSquareSdk(config.environment);
+        if (cancelled) return;
+
+        const payments = await square.payments(config.applicationId, config.locationId);
+        const card = await payments.card({ style: SQUARE_CARD_STYLE });
+        if (cancelled) {
+          await card.destroy().catch(() => {});
+          return;
+        }
+
+        const container = document.getElementById('square-card-container');
+        if (!container) return;
+        container.innerHTML = '';
+        await card.attach('#square-card-container');
+
+        if (cancelled) {
+          await card.destroy().catch(() => {});
+          return;
+        }
+
+        cardRef.current = card;
+        setCardReady(true);
+      } catch (err) {
+        if (!cancelled) {
+          setPaymentError(
+            err instanceof Error ? err.message : 'Unable to initialize Square checkout.'
+          );
+        }
+      } finally {
+        if (!cancelled) {
+          setConfigLoading(false);
+        }
+      }
+    }
+
+    void initSquare();
+
+    return () => {
+      cancelled = true;
+      setCardReady(false);
+      if (cardRef.current) {
+        const instance = cardRef.current;
+        cardRef.current = null;
+        void instance.destroy().catch(() => {});
+      }
+    };
+  }, [isOpen, step]);
+
   if (!isOpen) return null;
 
   const progressPct = Math.min(100, Math.round((totals.subtotal / FREE_SHIPPING_THRESHOLD) * 100));
 
-  const handleCheckoutSubmit = (e: React.FormEvent) => {
+  const handleCheckoutSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     const nextErrors = validateCheckoutForm(form);
     setErrors(nextErrors);
+    setPaymentError(null);
+
     if (Object.keys(nextErrors).length > 0) return;
 
-    const orderNum = `EJ-${Math.floor(1000 + Math.random() * 8999)}`;
-    setReceipt({
-      orderNumber: orderNum,
-      placedAt: new Date().toLocaleDateString('en-US', {
-        month: 'short',
-        day: 'numeric',
-        year: 'numeric',
-      }),
-      customer: { ...form },
-      items: [...items],
-      subtotal: totals.subtotal,
-      shipping: totals.shipping,
-      total: totals.total,
-    });
-    onClearCart();
-    setForm(INITIAL_FORM);
-    setErrors({});
-    setStep('confirmed');
+    if (!paymentConfig?.configured) {
+      setPaymentError(
+        'Square credentials are required on the server before processing card payments.'
+      );
+      return;
+    }
+
+    if (!cardRef.current || !cardReady) {
+      setPaymentError('Square card terminal is still initializing. Please try again.');
+      return;
+    }
+
+    setIsSubmitting(true);
+    try {
+      const tokenResult = await cardRef.current.tokenize();
+      if (tokenResult.status !== 'OK' || !tokenResult.token) {
+        const message =
+          tokenResult.errors?.[0]?.message || 'Please check your card details and try again.';
+        setPaymentError(message);
+        return;
+      }
+
+      const response = await fetch('/api/payments/square', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          sourceId: tokenResult.token,
+          customer: form,
+          items: items.map((item) => ({
+            productId: item.productId,
+            size: item.size,
+            colorway: item.colorway,
+            quantity: item.quantity,
+          })),
+        }),
+      });
+
+      const data = (await response.json().catch(() => null)) as {
+        error?: string;
+        orderNumber?: string;
+        paymentId?: string;
+        paymentStatus?: string;
+        cardSummary?: string;
+        receiptUrl?: string;
+        subtotal?: number;
+        shipping?: number;
+        total?: number;
+        placedAt?: string;
+      } | null;
+
+      if (!response.ok || !data?.orderNumber) {
+        setPaymentError(data?.error || 'Square could not complete this payment.');
+        return;
+      }
+
+      setReceipt({
+        orderNumber: data.orderNumber,
+        placedAt:
+          data.placedAt ??
+          new Date().toLocaleDateString('en-US', {
+            month: 'short',
+            day: 'numeric',
+            year: 'numeric',
+          }),
+        customer: { ...form },
+        items: [...items],
+        subtotal: data.subtotal ?? totals.subtotal,
+        shipping: data.shipping ?? totals.shipping,
+        total: data.total ?? totals.total,
+        paymentId: data.paymentId,
+        paymentStatus: data.paymentStatus,
+        cardSummary: data.cardSummary,
+        receiptUrl: data.receiptUrl,
+      });
+      onClearCart();
+      setForm(INITIAL_FORM);
+      setErrors({});
+      setStep('confirmed');
+    } catch {
+      setPaymentError('Network error while contacting Square checkout. Please try again.');
+    } finally {
+      setIsSubmitting(false);
+    }
   };
 
   return (
@@ -156,6 +330,28 @@ export function CartDrawer({
                 <p>
                   {receipt.customer.address}, {receipt.customer.city} {receipt.customer.postalCode}
                 </p>
+                {(receipt.paymentId || receipt.cardSummary) && (
+                  <div className="pt-2 text-xs text-[#A1A1AA]">
+                    <p className="font-semibold text-[#F4F4F2]">Square Payment</p>
+                    {receipt.cardSummary && <p>{receipt.cardSummary}</p>}
+                    {receipt.paymentId && (
+                      <p className="font-mono text-[11px] text-[#71717A]">
+                        Ref: {receipt.paymentId}
+                      </p>
+                    )}
+                    {receipt.receiptUrl && (
+                      <a
+                        href={receipt.receiptUrl}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="mt-1.5 inline-flex items-center gap-1 font-medium text-[#22C55E] hover:underline"
+                      >
+                        View Square Receipt
+                        <ExternalLink className="h-3 w-3" />
+                      </a>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div className="space-y-3">
@@ -421,17 +617,84 @@ export function CartDrawer({
               </div>
             </div>
 
-            <div className="mt-6 space-y-3 border-t border-white/10 pt-4">
-              <div className="flex items-center justify-between text-sm font-semibold text-[#F4F4F2]">
-                <span>Order Total</span>
-                <span className="tabular-nums">{formatCurrency(totals.total)}</span>
+            <div className="mt-6 space-y-4 border-t border-white/10 pt-5">
+              <div className="space-y-2.5">
+                <div className="flex items-center justify-between">
+                  <span className="inline-flex items-center gap-1.5 text-xs font-semibold tracking-wide text-[#F4F4F2]">
+                    <CreditCard className="h-3.5 w-3.5 text-[#22C55E]" aria-hidden="true" />
+                    Square Card Payment
+                  </span>
+                  <span className="inline-flex items-center gap-1 text-[11px] text-[#A1A1AA]">
+                    <Lock className="h-3 w-3" aria-hidden="true" />
+                    {paymentConfig?.environment === 'production' ? 'Encrypted' : 'Square Checkout'}
+                  </span>
+                </div>
+
+                {configLoading ? (
+                  <div className="flex min-h-14 items-center gap-2.5 rounded-md border border-white/15 bg-[#181A1C] px-3.5 py-3 text-xs text-[#A1A1AA]">
+                    <Loader2 className="h-4 w-4 animate-spin text-[#22C55E]" aria-hidden="true" />
+                    <span>Connecting to Square payment terminal...</span>
+                  </div>
+                ) : paymentConfig && !paymentConfig.configured ? (
+                  <div
+                    role="status"
+                    className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs leading-relaxed text-amber-200"
+                  >
+                    <p className="font-semibold text-amber-100">Square Checkout Setup Required</p>
+                    <p className="mt-1 text-amber-200/85">
+                      {paymentConfig.configIssue ? (
+                        paymentConfig.configIssue
+                      ) : (
+                        <>
+                          Add <code className="font-mono">SQUARE_APPLICATION_ID</code>,{' '}
+                          <code className="font-mono">SQUARE_LOCATION_ID</code>, and{' '}
+                          <code className="font-mono">SQUARE_ACCESS_TOKEN</code> in environment
+                          secrets to enable live or sandbox Square card processing.
+                        </>
+                      )}
+                    </p>
+                  </div>
+                ) : (
+                  <div className="rounded-md border border-white/15 bg-[#181A1C] p-3">
+                    <div
+                      id="square-card-container"
+                      data-ready={cardReady ? 'true' : 'false'}
+                      className="min-h-12"
+                    />
+                  </div>
+                )}
+
+                {paymentError && (
+                  <div
+                    role="alert"
+                    className="flex items-start gap-2 rounded-md border border-red-500/30 bg-red-500/10 px-3 py-2.5 text-xs text-red-300"
+                  >
+                    <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0" aria-hidden="true" />
+                    <span>{paymentError}</span>
+                  </div>
+                )}
               </div>
-              <button
-                type="submit"
-                className="min-h-12 w-full rounded-md bg-[#16A34A] px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#15803D]"
-              >
-                Confirm Order — {formatCurrency(totals.total)}
-              </button>
+
+              <div className="space-y-3 border-t border-white/10 pt-4">
+                <div className="flex items-center justify-between text-sm font-semibold text-[#F4F4F2]">
+                  <span>Order Total</span>
+                  <span className="tabular-nums">{formatCurrency(totals.total)}</span>
+                </div>
+                <button
+                  type="submit"
+                  disabled={isSubmitting || configLoading}
+                  className="inline-flex min-h-12 w-full items-center justify-center gap-2 rounded-md bg-[#16A34A] px-6 py-3 text-sm font-semibold text-white transition-colors hover:bg-[#15803D] disabled:cursor-not-allowed disabled:opacity-60"
+                >
+                  {isSubmitting ? (
+                    <>
+                      <Loader2 className="h-4 w-4 animate-spin" aria-hidden="true" />
+                      Processing Square Payment...
+                    </>
+                  ) : (
+                    `Pay with Square — ${formatCurrency(totals.total)}`
+                  )}
+                </button>
+              </div>
             </div>
           </form>
         )}

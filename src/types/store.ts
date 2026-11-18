@@ -46,6 +46,14 @@ export interface CheckoutForm {
 
 export type CheckoutErrors = Partial<Record<keyof CheckoutForm, string>>;
 
+export interface SquarePaymentConfig {
+  configured: boolean;
+  environment: 'sandbox' | 'production';
+  applicationId: string | null;
+  locationId: string | null;
+  configIssue?: string | null;
+}
+
 export interface OrderReceipt {
   orderNumber: string;
   placedAt: string;
@@ -54,4 +62,9 @@ export interface OrderReceipt {
   subtotal: number;
   shipping: number;
   total: number;
+  paymentId?: string;
+  paymentStatus?: string;
+  cardSummary?: string;
+  receiptUrl?: string;
 }
+
